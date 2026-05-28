@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +97,31 @@ def detect_leaked_values(output_text: str, token_to_value: dict[str, str], ignor
     return [{"token": token, "value": leaked_by_token[token]} for token in sorted(leaked_by_token)]
 
 
+
+
+def _prf(tp: int, fp: int, fn: int) -> dict[str, float | int]:
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 1.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+    return {
+        "true_positive": tp,
+        "false_positive": fp,
+        "false_negative": fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def _multiset_prf(expected_tokens: list[str], actual_tokens: list[str]) -> dict[str, float | int]:
+    expected = Counter(expected_tokens)
+    actual = Counter(actual_tokens)
+    labels = set(expected) | set(actual)
+    tp = sum(min(expected[label], actual[label]) for label in labels)
+    fp = sum(max(0, actual[label] - expected[label]) for label in labels)
+    fn = sum(max(0, expected[label] - actual[label]) for label in labels)
+    return _prf(tp, fp, fn)
+
 def evaluate_against_ground_truth(
     output_docx: str | Path,
     ground_truth_docx: str | Path,
@@ -126,6 +152,12 @@ def evaluate_against_ground_truth(
     if token_to_value and ignore_tokens:
         exact_match = _canonicalize_ignored_values(output_text, token_to_value, ignore_tokens) == _canonicalize_ignored_values(expected_text, token_to_value, ignore_tokens)
 
+    unique_tp = len(expected_token_set & actual_token_set)
+    unique_fp = len(actual_token_set - expected_token_set)
+    unique_fn = len(expected_token_set - actual_token_set)
+    unique_metrics = _prf(unique_tp, unique_fp, unique_fn)
+    occurrence_metrics = _multiset_prf(expected_tokens, actual_tokens)
+
     return {
         "exact_text_match": exact_match,
         "raw_exact_text_match": raw_exact_match,
@@ -136,6 +168,18 @@ def evaluate_against_ground_truth(
         "missing_expected_unique_tokens": sorted(expected_token_set - actual_token_set),
         "extra_unique_tokens": sorted(actual_token_set - expected_token_set),
         "leaked_values": leaked_values,
+        "residual_leak_count": len(leaked_values),
+        "safety_pass": len(leaked_values) == 0,
+        "quality": {
+            "unique_token_precision": unique_metrics["precision"],
+            "unique_token_recall": unique_metrics["recall"],
+            "unique_token_f1": unique_metrics["f1"],
+            "token_occurrence_precision": occurrence_metrics["precision"],
+            "token_occurrence_recall": occurrence_metrics["recall"],
+            "token_occurrence_f1": occurrence_metrics["f1"],
+        },
+        "unique_token_metrics": unique_metrics,
+        "token_occurrence_metrics": occurrence_metrics,
         "missing_expected_tokens_with_mapping": missing_expected_tokens,
         "ignored_tokens": sorted(ignore_tokens),
     }

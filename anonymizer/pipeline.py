@@ -14,11 +14,37 @@ from .types import EntitySpan, Replacement
 
 SOURCE_PRIORITY = {"fixture": 4, "llm": 3, "regex": 2}
 
+# Specific enclosing spans must sometimes win over shorter LLM spans.
+# Example: AUTH_DOCUMENT over an inner POWER_OF_ATTORNEY_NUMBER,
+# BANK_ADDRESS/ORG_ADDRESS over a nested CITY_TOKEN. This is a narrow
+# safety rule, not a switch to regex-first extraction.
+LABEL_PRIORITY = {
+    "AUTH_DOCUMENT": 120,
+    "ORG_ADDRESS": 112,
+    "BANK_ADDRESS": 110,
+    "POSTAL_ADDRESS": 105,
+    "PERSON_ADDRESS": 105,
+    "OBJECT_ADDRESS": 105,
+    "BANK_ORG_FULL": 100,
+    "ORG_FULL": 98,
+    "BANK_ALIAS": 95,
+    "BANK_ALIAS_NOISY": 95,
+    "ORG_ALIAS": 94,
+    "ORG_ALIAS_NOISY": 94,
+    "PERSON_NOISY": 92,
+    "PERSON_SHORT_NOISY": 92,
+    "TEXT_SIGNATURE_TOKEN": 90,
+    "STAMP_TOKEN": 90,
+    "SIGNATURE_IMAGE_TOKEN": 90,
+    "STAMP_IMAGE_TOKEN": 90,
+    "CITY_TOKEN": 40,
+}
+
 
 def merge_spans(spans: Iterable[EntitySpan]) -> list[EntitySpan]:
     ordered = sorted(
         spans,
-        key=lambda s: (SOURCE_PRIORITY.get(s.source, 0), s.confidence, s.length),
+        key=lambda s: (1 if s.source == "fixture" else 0, LABEL_PRIORITY.get(s.label, 50), SOURCE_PRIORITY.get(s.source, 0), s.confidence, s.length),
         reverse=True,
     )
     accepted: list[EntitySpan] = []
@@ -54,8 +80,9 @@ class TokenPolicy:
         key = (clean_label, value)
         if key in self.by_value:
             return self.by_value[key]
-        self.counters[clean_label] += 1
-        token = f"[{clean_label}_{self.counters[clean_label]}]"
+        counter_key = "IMAGE_TOKEN" if clean_label in {"SIGNATURE_IMAGE_TOKEN", "STAMP_IMAGE_TOKEN"} else clean_label
+        self.counters[counter_key] += 1
+        token = f"[{clean_label}_{self.counters[counter_key]}]"
         self.by_value[key] = token
         return token
 
@@ -116,7 +143,7 @@ def _regex_audit_candidates(text: str, regex_spans: list[EntitySpan]) -> list[di
     return candidates
 
 
-def anonymize_text(text: str, llm_mode: str = "openai", model: str = "gpt-4.1-mini", env_path: str | None = None, fixture_mapping: str | None = None) -> tuple[str, list[Replacement], list[EntitySpan]]:
+def anonymize_text(text: str, llm_mode: str = "openai", model: str = "gpt-4.1-mini", env_path: str | None = None, fixture_mapping: str | None = None) -> tuple[str, list[Replacement], list[EntitySpan], dict]:
     regex_spans = detect_regex_entities(text)
     regex_candidates = _regex_audit_candidates(text, regex_spans)
     detector = make_detector(llm_mode, model, env_path, fixture_mapping)
@@ -127,12 +154,13 @@ def anonymize_text(text: str, llm_mode: str = "openai", model: str = "gpt-4.1-mi
     anonymized = text
     for repl in replacements:
         anonymized = anonymized.replace(repl.value, repl.replacement)
-    return anonymized, replacements, spans
+    metadata = getattr(detector, "metadata", {})
+    return anonymized, replacements, spans, metadata
 
 
-def anonymize_docx(input_docx: str | Path, output_docx: str | Path, report_json: str | Path | None = None, llm_mode: str = "openai", model: str = "gpt-4.1-mini", env_path: str | None = None, fixture_mapping: str | None = None) -> dict:
+def anonymize_docx(input_docx: str | Path, output_docx: str | Path, report_json: str | Path | None = None, llm_mode: str = "openai", model: str = "gpt-4.1-mini", env_path: str | None = None, fixture_mapping: str | Path | None = None) -> dict:
     text = extract_docx_text(input_docx)
-    _, replacements, spans = anonymize_text(text, llm_mode=llm_mode, model=model, env_path=env_path, fixture_mapping=fixture_mapping)
+    _, replacements, spans, detector_metadata = anonymize_text(text, llm_mode=llm_mode, model=model, env_path=env_path, fixture_mapping=fixture_mapping)
     value_to_token = {r.value: r.replacement for r in replacements}
     anonymize_docx_by_values(input_docx, output_docx, value_to_token)
     report = {
@@ -140,6 +168,7 @@ def anonymize_docx(input_docx: str | Path, output_docx: str | Path, report_json:
         "output_docx": str(output_docx),
         "llm_mode": llm_mode,
         "model": model,
+        "llm_metadata": detector_metadata,
         "entity_count": len(spans),
         "replacement_count": len(replacements),
         "replacements": [asdict(r) for r in replacements],

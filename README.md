@@ -1,11 +1,6 @@
-# LLM-first + regex-audit anonymizer for DOCX
+# DOCX anonymizer: LLM-first + regex audit
 
-Метод ограничен двумя слоями, без дополнительных NER-моделей.
-
-1. `GPT-4.1-mini` — основной extractor и classifier. ЛЛМ получает полный список целевых labels, исходный текст и regex-кандидаты как подсказки. Она должна сама извлечь точные подстроки и выбрать тип сущности.
-2. `regex` — audit/fallback слой для формальных сущностей с устойчивой структурой: ИНН, ОГРН, КПП, счета, телефоны, email, URL, кадастр, номера договоров, служебные коды. Regex не является источником истины для семантического типа и имеет более низкий приоритет при merge.
-
-В OpenAI-режиме используется два LLM-прохода: широкий extraction-pass и adjudication-pass для уточнения типов, особенно когда regex дал слишком общий `DOCUMENT_NUMBER_VARIANT` или конфликтующий формальный label.
+Короткий проект для обезличивания DOCX. Основной extractor/classifier — LLM. Regex используется как audit/fallback для формальных реквизитов и узкого safety-sweep по стабильным сегментам.
 
 ## Установка
 
@@ -16,13 +11,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-В `.env` положить ключ:
+В `.env`:
 
 ```bash
 OPENAI_API_KEY=sk-...
 ```
 
-## Запуск на тестовом DOCX через OpenAI API
+## OpenAI eval
 
 ```bash
 python3 -m anonymizer.cli \
@@ -37,13 +32,11 @@ python3 -m anonymizer.cli \
 
 Результаты:
 
-- `outputs/openai_eval/anonymized.docx` — обезличенный DOCX;
-- `outputs/openai_eval/anonymization_report.json` — найденные сущности и замены;
-- `outputs/openai_eval/eval_metrics.json` — сравнение с tokenized ground truth. В `exact_text_match` не учитываются токены из `ignored_tokens`, например дата `[DATE_NON_TARGET_1]`, если для них есть значение в mapping. Поле `raw_exact_text_match` оставлено для строгого побайтового сравнения извлеченного текста.
+- `anonymized.docx` — обезличенный документ;
+- `anonymization_report.json` — найденные сущности и замены;
+- `eval_metrics.json` — `precision/recall/f1`, `residual_leak_count`, `safety_pass`.
 
-## Запуск без API для проверки пайплайна DOCX
-
-Это не production-режим. Он использует fixture mapping из созданной пары документов, чтобы проверить замену в DOCX и метрики без расхода токенов.
+## Offline check без API
 
 ```bash
 python3 -m anonymizer.cli \
@@ -54,7 +47,7 @@ python3 -m anonymizer.cli \
   --out-dir outputs/fixture_eval
 ```
 
-## Обезличивание произвольного DOCX
+## Обычное обезличивание
 
 ```bash
 python3 -m anonymizer.cli \
@@ -66,17 +59,16 @@ python3 -m anonymizer.cli \
   --output outputs/anonymized.docx
 ```
 
-## Важные ограничения
+## Логика
 
-- Даты по умолчанию не являются целевыми сущностями. В тестовой tokenized-версии есть `[DATE_NON_TARGET_1]`, поэтому evaluator по умолчанию игнорирует этот токен и нормализует его при `exact_text_match`, если передан `token_to_synthetic_mapping`.
-- Проверка утечек не использует простой `value in text`: evaluator ищет диапазоны значений и не дублирует утечки для коротких значений, если они встречаются только внутри более длинной сущности. Например, город внутри адреса или домен внутри email/URL не считается отдельной утечкой.
-- DOCX-замена старается сохранять run-структуру. Если сущность разрезана между runs, абзац схлопывается в один run. Это осознанный fallback для корректной замены.
-- LLM имеет приоритет над regex при пересечении spans. Regex остается fallback-аудитом для пропусков и формальных хвостов.
-- Regex используется там, где это критично для audit/fallback: формальные реквизиты, границы email/URL/телефонов, банковские счета и номера документов.
-- Для продуктивного режима качество зависит от промпта, от точности returned `value` и от второго adjudication-pass.
+1. LLM broad extraction.
+2. LLM adjudication-pass для уточнения типов.
+3. Regex audit/fallback для формальных сущностей.
+4. Узкий safety-sweep для стабильных сегментов: `IP_FULL`, `PROJECT_NAME`, noisy ФИО/алиасы, подписи, печати, графические блоки подписи/печати.
+5. Eval считает F-score и отдельно проверяет `safety_pass`.
 
 ## Тесты
 
 ```bash
-pytest
+pytest -q
 ```

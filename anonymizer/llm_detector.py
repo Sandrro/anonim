@@ -192,16 +192,17 @@ class OpenAILLMDetector:
             raise RuntimeError("OPENAI_API_KEY is not set. Put it into .env or environment variables.")
         self.client = OpenAI()
         self.model = model
+        self.metadata: dict[str, Any] = {"responses": []}
 
     def _call_structured(self, system_prompt: str, user_payload: dict[str, Any], name: str) -> dict[str, Any]:
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
+        params: dict[str, Any] = {
+            "model": self.model,
+            "input": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
             ],
-            temperature=0,
-            text={
+            "temperature": 0,
+            "text": {
                 "format": {
                     "type": "json_schema",
                     "name": name,
@@ -209,7 +210,13 @@ class OpenAILLMDetector:
                     "strict": True,
                 }
             },
-        )
+        }
+        response = self.client.responses.create(**params)
+        self.metadata.setdefault("responses", []).append({
+            "name": name,
+            "system_fingerprint": getattr(response, "system_fingerprint", None),
+            "usage": getattr(response, "usage", None).model_dump() if hasattr(getattr(response, "usage", None), "model_dump") else None,
+        })
         raw = _response_text(response)
         return json.loads(raw)
 
@@ -243,6 +250,8 @@ class OpenAILLMDetector:
 
 
 class DisabledLLMDetector:
+    metadata: dict[str, Any] = {"responses": []}
+
     def detect(self, text: str, regex_values: list[Any] | None = None) -> list[EntitySpan]:
         return []
 
@@ -255,6 +264,7 @@ class FixtureLLMDetector:
 
     def __init__(self, mapping_path: str | Path):
         self.synthetic_to_token = json.loads(Path(mapping_path).read_text(encoding="utf-8"))
+        self.metadata: dict[str, Any] = {"responses": [], "fixture_mapping": str(mapping_path)}
 
     def detect(self, text: str, regex_values: list[Any] | None = None) -> list[EntitySpan]:
         spans: list[EntitySpan] = []

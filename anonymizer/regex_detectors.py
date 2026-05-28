@@ -14,6 +14,7 @@ class RegexRule:
     group: str = "value"
     confidence: float = 1.0
     label_from_match: Callable[[re.Match[str]], str] | None = None
+    validator: Callable[[str], bool] | None = None
 
     def iter_spans(self, text: str) -> list[EntitySpan]:
         spans: list[EntitySpan] = []
@@ -25,6 +26,8 @@ class RegexRule:
                 start, end = match.span(0)
                 value = match.group(0)
             if start < 0 or end <= start or not value.strip():
+                continue
+            if self.validator and not self.validator(value):
                 continue
             label = self.label_from_match(match) if self.label_from_match else self.label
             spans.append(EntitySpan(label=label, value=value, start=start, end=end, source="regex", confidence=self.confidence))
@@ -112,7 +115,80 @@ def _client_service_label(match: re.Match[str]) -> str:
     return "SERVICE_CODE"
 
 
+LATIN_HOMOGLYPHS = set("AaBCcEeHKMOoPpTXxy")
+CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+
+def _has_latin_cyrillic_mix(value: str) -> bool:
+    return any(ch in LATIN_HOMOGLYPHS for ch in value) and bool(CYRILLIC_RE.search(value))
+
+
+def _is_noisy_person_like(value: str) -> bool:
+    words = value.split()
+    if len(words) != 3 or not _has_latin_cyrillic_mix(value):
+        return False
+    # Keep this safety rule conservative: it is intended for noisy full names,
+    # not arbitrary mixed-script phrases such as domain fragments or table cells.
+    for word in words:
+        if not re.match(r"^[А-ЯЁA-Z][А-Яа-яЁёA-Za-z]{2,}$", word):
+            return False
+        if word.isupper() and re.search(r"[A-Z]", word):
+            return False
+    first = words[0].casefold().replace("a", "а").replace("o", "о")
+    if first in {"банк", "бaнк"}:
+        return False
+    return True
+
+
+def _is_noisy_short_person_like(value: str) -> bool:
+    return _has_latin_cyrillic_mix(value) and bool(re.search(r"[А-ЯA-ZЁ]\.[А-ЯA-ZЁ]\.", value))
+
+
+def _org_name_label(match: re.Match[str]) -> str:
+    value = match.group("value")
+    lower = value.casefold()
+    noisy = _has_latin_cyrillic_mix(value)
+    is_bank = "банк" in lower or "бaнк" in lower
+    is_full_bank = "публичное акционерное общество" in lower and is_bank
+    if is_full_bank:
+        return "BANK_ORG_FULL"
+    if is_bank:
+        return "BANK_ALIAS_NOISY" if noisy else "BANK_ALIAS"
+    is_full_org = "общество с ограниченной ответственностью" in lower or "акционерное общество" in lower
+    if is_full_org:
+        return "ORG_FULL"
+    return "ORG_ALIAS_NOISY" if noisy else "ORG_ALIAS"
+
+
+def _address_label(match: re.Match[str]) -> str:
+    context = _context(match, left=220, right=40)
+    if "кредитор" in context or "банк" in context or "бик" in context or "к/с" in context or "корреспондент" in context:
+        return "BANK_ADDRESS"
+    return "ORG_ADDRESS"
+
+
 RULES: list[RegexRule] = [
+    # Narrow residual/alias audit. These regexes are deliberately used as
+    # safety fallback for forms LLM may miss: short aliases, noisy aliases,
+    # authorization documents, positions and organization/bank addresses.
+    # High-precision safety sweep for classes that LLM may skip but which are
+    # structurally stable enough to replace automatically. These are segment
+    # classes, not fixture-specific values.
+    RegexRule("IP_FULL", re.compile(r"(?P<value>ИП\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})(?=[,.;\n]|\s+в\s+качестве|$)", FLAGS), confidence=1.10),
+    RegexRule("PROJECT_NAME", re.compile(r"(?P<value>(?:жилой\s+комплекс|ЖК|проект)\s+«[^»]{2,120}»)", FLAGS), confidence=1.10),
+    RegexRule("TEXT_SIGNATURE_TOKEN", re.compile(r"(?P<value>подпись\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.)", FLAGS), confidence=1.10),
+    RegexRule("STAMP_TOKEN", re.compile(r"(?:М\.П\.\s+)?(?P<value>оттиск\s+печати\s+[^\n\r,.;]{3,80})", FLAGS), confidence=1.10),
+    RegexRule("SIGNATURE_IMAGE_TOKEN", re.compile(r"(?P<value>графический\s+блок\s+подписи\s+[A-ZА-Я0-9][A-ZА-Я0-9\-_/]{2,})", FLAGS), confidence=1.10),
+    RegexRule("STAMP_IMAGE_TOKEN", re.compile(r"(?P<value>графический\s+блок\s+печати\s+[A-ZА-Я0-9][A-ZА-Я0-9\-_/]{2,})", FLAGS), confidence=1.10),
+    RegexRule("PERSON_SHORT_NOISY", re.compile(r"(?P<value>[А-ЯA-ZЁ][А-Яа-яA-Za-zЁё]+\s+[А-ЯA-ZЁ]\.[А-ЯA-ZЁ]\.)", FLAGS), confidence=1.05, validator=_is_noisy_short_person_like),
+    RegexRule("PERSON_NOISY", re.compile(r"(?P<value>[А-ЯA-ZЁ][А-Яа-яA-Za-zЁё]{2,}(?:\s+[А-ЯA-ZЁ][А-Яа-яA-Za-zЁё]{2,}){1,2})", FLAGS), confidence=1.05, validator=_is_noisy_person_like),
+    RegexRule("AUTH_DOCUMENT", re.compile(r"основании\s+(?P<value>Устава\s+Банка\s+и\s+доверенности\s+[\wА-Яа-я\-/]+)", FLAGS), confidence=1.20),
+    RegexRule("AUTH_DOCUMENT", re.compile(r"основании\s+(?P<value>Устава\s+Общества\s+и\s+решения\s+участника\s+№\s*[\wА-Яа-я\-/]+)", FLAGS), confidence=1.20),
+    RegexRule("POSITION", re.compile(r"(?P<value>заместителя\s+председателя\s+правления|генерального\s+директора)", FLAGS), confidence=0.90),
+    RegexRule("ORG_FULL", re.compile(r"(?P<value>(?:Общество\s+с\s+ограниченной\s+ответственностью|Акционерное\s+общество|Публичное\s+акционерное\s+общество)\s+«[^»]{2,100}»)", FLAGS), confidence=0.88, label_from_match=_org_name_label),
+    RegexRule("ORG_ALIAS", re.compile(r"(?P<value>(?:ООО|OOO|АО|AО|ПАО|ПAО)\s+«[^»]{2,80}»)", FLAGS), confidence=0.88, label_from_match=_org_name_label),
+    RegexRule("BANK_ALIAS", re.compile(r"(?P<value>(?:ПАО|ПAО)\s+Б[аa]нк\s+[А-ЯA-Z][А-Яа-яA-Za-zЁё\- ]{2,80})(?=[,.;\n]|$)", FLAGS), confidence=0.88, label_from_match=_org_name_label),
+    RegexRule("ORG_ADDRESS", re.compile(r"(?:Место\s+нахождения\s+Заемщика|Адрес)\s*:\s*(?P<value>\d{6},\s*г\.\s*[^\n]+?)(?=\.\s+Почтовый|\n|$)", FLAGS), confidence=0.90, label_from_match=_address_label),
     # Normal email must not be downgraded to EMAIL_NOISY. The noisy rule requires
     # actual spacing around @ or dot.
     RegexRule("EMAIL", re.compile(rf"{WORD_BOUNDARY_LEFT}(?P<value>[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{{2,}}){WORD_BOUNDARY_RIGHT}", FLAGS)),
