@@ -51,7 +51,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="DOCX anonymization with LLM-first extraction and regex audit/fallback.")
+    parser = argparse.ArgumentParser(description="DOCX anonymization with LLM-first extract-normalize-replace-audit pipeline.")
     parser.add_argument("--model", default="gpt-4.1-mini", help="OpenAI model name.")
     parser.add_argument("--env", default=None, help="Path to .env with OPENAI_API_KEY.")
     parser.add_argument("--llm-mode", choices=["openai", "off", "fixture"], default="openai", help="LLM provider. Use fixture only for bundled offline test.")

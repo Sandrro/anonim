@@ -1,7 +1,11 @@
 from pathlib import Path
 
+from anonymizer.audit_safety import collect_safety_candidates
 from anonymizer.evaluate import detect_leaked_values, evaluate_against_ground_truth
-from anonymizer.pipeline import anonymize_docx
+from anonymizer.llm_detector import chunk_text
+from anonymizer.pipeline import anonymize_docx, anonymize_text
+from anonymizer.replacement_plan import build_replacement_plan, merge_spans, plan_items_to_replacements
+from anonymizer.types import CanonicalEntity, EntitySpan, EntityVariant
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,6 +28,20 @@ def test_fixture_mode_matches_ground_truth_without_known_value_leaks(tmp_path):
     assert metrics["missing_expected_unique_tokens"] == []
     assert metrics["extra_unique_tokens"] == []
     assert metrics["leaked_values"] == []
+    assert metrics["quality"]["unique_token_f1"] == 1.0
+    assert metrics["quality"]["token_occurrence_f1"] == 1.0
+    assert metrics["safety_pass"] is True
+
+
+def test_fixture_pipeline_report_contains_new_stages():
+    text = "ИП Иванов Иван Иванович"
+    anonymized, replacements, spans, metadata = anonymize_text(
+        text,
+        llm_mode="fixture",
+        fixture_mapping=ROOT / "fixtures" / "synthetic_to_token_mapping.json",
+    )
+    assert metadata["stages"] == ["extract", "normalize_expand", "replacement_plan", "replace", "audit", "second_pass_replace"]
+    assert "replacement_plan" in metadata
 
 
 def test_leak_checker_does_not_duplicate_nested_substring_leaks():
@@ -54,123 +72,73 @@ def test_leak_checker_still_reports_standalone_short_value():
     )
     assert {item["token"] for item in leaks} == {"[CITY_TOKEN_1]", "[BANK_ADDRESS_1]"}
 
-from anonymizer.regex_detectors import detect_regex_entities
-from anonymizer.pipeline import merge_spans, build_replacements
-from anonymizer.types import EntitySpan
 
-
-def _labels_for(text: str, value: str) -> set[str]:
-    return {span.label for span in detect_regex_entities(text) if span.value == value}
-
-
-def test_regex_audit_does_not_turn_inn_into_phone_or_passport():
-    text = "Сведения об индивидуальном предпринимателе: ОГРНИП 326780512345678, ИНН 780512345678."
-    labels = _labels_for(text, "780512345678")
-    assert labels == {"INN_IP"}
-
-
-def test_regex_audit_keeps_normal_and_noisy_email_separate():
-    text = "Email: office@lazurny-kontur.test; noisy: office @ lazurny-kontur . test"
-    assert _labels_for(text, "office@lazurny-kontur.test") == {"EMAIL"}
-    assert _labels_for(text, "office @ lazurny-kontur . test") == {"EMAIL_NOISY"}
-
-
-def test_regex_audit_fax_wins_over_generic_noisy_phone_on_merge():
-    text = "факс 8 812 456 70 91"
-    spans = merge_spans(detect_regex_entities(text))
-    assert [(span.label, span.value) for span in spans] == [("FAX", "8 812 456 70 91")]
-
-
-def test_regex_audit_does_not_create_document_number_inside_domain():
-    text = "сайт lazurny-kontur.test, email office@lazurny-kontur.test"
-    spans = detect_regex_entities(text)
-    assert any(span.label == "WEBSITE" and span.value == "lazurny-kontur.test" for span in spans)
-    assert not any(span.label == "DOCUMENT_NUMBER_VARIANT" and "kontur" in span.value for span in spans)
-
-
-def test_llm_has_priority_over_regex_for_same_value():
-    regex_span = EntitySpan("DOCUMENT_NUMBER_VARIANT", "ДК-ЛК-77-2603", 0, 14, "regex", 0.65)
-    llm_span = EntitySpan("SERVICE_CONTRACT_CODE", "ДК-ЛК-77-2603", 0, 14, "llm", 0.92)
-    spans = merge_spans([regex_span, llm_span])
-    replacements = build_replacements(spans)
-    assert replacements[0].label == "SERVICE_CONTRACT_CODE"
-
-
-def test_evaluator_reports_precision_recall_f1(tmp_path):
-    output = tmp_path / "anonymized.docx"
-    anonymize_docx(
-        ROOT / "fixtures" / "synthetic_obezlichivanie_fixture.docx",
-        output,
-        report_json=tmp_path / "report.json",
-        llm_mode="fixture",
-        fixture_mapping=ROOT / "fixtures" / "synthetic_to_token_mapping.json",
+def test_replacement_plan_uses_variants_and_programmatic_tokens():
+    text = "Публичное акционерное общество «Банк Северная Орбита» или ПАО «Банк Северная Орбита" + "»"
+    entity = CanonicalEntity(
+        canonical_id="bank_1",
+        label="BANK_ORG_FULL",
+        canonical="Публичное акционерное общество «Банк Северная Орбита»",
+        variants=(
+            EntityVariant("Публичное акционерное общество «Банк Северная Орбита»", "BANK_ORG_FULL", "full"),
+            EntityVariant("ПАО «Банк Северная Орбита»", "BANK_ALIAS", "alias"),
+        ),
+        source="llm",
+        confidence=0.92,
     )
-    metrics = evaluate_against_ground_truth(
-        output,
-        ROOT / "fixtures" / "tokenized_obezlichivanie_fixture.docx",
-        token_to_synthetic_mapping=ROOT / "fixtures" / "token_to_synthetic_mapping.json",
-    )
-    assert metrics["quality"]["unique_token_f1"] == 1.0
-    assert metrics["quality"]["token_occurrence_f1"] == 1.0
-    assert metrics["safety_pass"] is True
+    plan, spans = build_replacement_plan(text, [entity])
+    values = {item.value: item.replacement for item in plan}
+    assert values["Публичное акционерное общество «Банк Северная Орбита»"] == "[BANK_ORG_FULL_1]"
+    assert values["ПАО «Банк Северная Орбита»"] == "[BANK_ALIAS_1]"
 
 
-def test_regex_audit_covers_org_bank_aliases_and_auth_documents():
-    text = (
-        "ООО «Полярный Резерв», ПАО «Банк Северная Орбита», "
-        "OOO «Лaзурный-Контур», ПAО Бaнк Северная Oрбита. "
-        "действующего на основании Устава Банка и доверенности БСО-77/26"
-    )
-    labels = {(span.label, span.value) for span in detect_regex_entities(text)}
-    assert ("ORG_ALIAS", "ООО «Полярный Резерв»") in labels
-    assert ("BANK_ALIAS", "ПАО «Банк Северная Орбита»") in labels
-    assert ("ORG_ALIAS_NOISY", "OOO «Лaзурный-Контур»") in labels
-    assert ("BANK_ALIAS_NOISY", "ПAО Бaнк Северная Oрбита") in labels
-    assert ("AUTH_DOCUMENT", "Устава Банка и доверенности БСО-77/26") in labels
-
-
-def test_specific_safety_span_can_win_over_inner_llm_span():
+def test_specific_safety_span_can_win_over_inner_span():
     text = "на основании Устава Банка и доверенности БСО-77/26"
-    regex_span = EntitySpan("AUTH_DOCUMENT", "Устава Банка и доверенности БСО-77/26", 13, 50, "regex", 1.2)
-    llm_span = EntitySpan("POWER_OF_ATTORNEY_NUMBER", "БСО-77/26", 41, 50, "llm", 0.92)
-    spans = merge_spans([regex_span, llm_span])
+    auth_span = EntitySpan("AUTH_DOCUMENT", "Устава Банка и доверенности БСО-77/26", 13, 50, "llm", 0.92)
+    inner_span = EntitySpan("POWER_OF_ATTORNEY_NUMBER", "БСО-77/26", 41, 50, "llm", 0.92)
+    spans = merge_spans([auth_span, inner_span])
     assert [(span.label, span.value) for span in spans] == [("AUTH_DOCUMENT", "Устава Банка и доверенности БСО-77/26")]
 
 
-def test_safety_sweep_covers_soft_noisy_segments():
-    text = (
-        "ИП Громов Артем Валерьевич; проект жилой комплекс «Лазурная Верфь». "
-        "Лeбедeвa Мaрия Ильинична; Лeбедева М.И.; "
-        "подпись Орлова П.С.; М.П. оттиск печати кредитора; "
-        "Изображение подписи: графический блок подписи S-ORL-01; "
-        "Изображение печати: графический блок печати ST-LK-02"
-    )
-    labels = {(span.label, span.value) for span in detect_regex_entities(text)}
-    assert ("IP_FULL", "ИП Громов Артем Валерьевич") in labels
-    assert ("PROJECT_NAME", "жилой комплекс «Лазурная Верфь»") in labels
-    assert ("PERSON_NOISY", "Лeбедeвa Мaрия Ильинична") in labels
-    assert ("PERSON_SHORT_NOISY", "Лeбедева М.И.") in labels
-    assert ("TEXT_SIGNATURE_TOKEN", "подпись Орлова П.С.") in labels
-    assert ("STAMP_TOKEN", "оттиск печати кредитора") in labels
-    assert ("SIGNATURE_IMAGE_TOKEN", "графический блок подписи S-ORL-01") in labels
-    assert ("STAMP_IMAGE_TOKEN", "графический блок печати ST-LK-02") in labels
-
-
-def test_org_address_priority_can_beat_wrong_bank_address_on_same_span():
-    value = "197110, г. Санкт-Петербург, ул. Лоцманская, д. 12, офис 405"
-    org_span = EntitySpan("ORG_ADDRESS", value, 0, len(value), "regex", 0.9)
-    bank_span = EntitySpan("BANK_ADDRESS", value, 0, len(value), "llm", 0.92)
-    spans = merge_spans([org_span, bank_span])
-    assert [(span.label, span.value) for span in spans] == [("ORG_ADDRESS", value)]
-
-
 def test_image_tokens_share_numbering_counter():
-    spans = [
-        EntitySpan("SIGNATURE_IMAGE_TOKEN", "графический блок подписи S-ORL-01", 0, 33, "regex", 1.1),
-        EntitySpan("STAMP_IMAGE_TOKEN", "графический блок печати ST-LK-02", 50, 82, "regex", 1.1),
+    text = "графический блок подписи S-ORL-01; графический блок печати ST-LK-02"
+    entities = [
+        CanonicalEntity(
+            canonical_id="signature_image",
+            label="SIGNATURE_IMAGE_TOKEN",
+            canonical="графический блок подписи S-ORL-01",
+            variants=(EntityVariant("графический блок подписи S-ORL-01", "SIGNATURE_IMAGE_TOKEN"),),
+        ),
+        CanonicalEntity(
+            canonical_id="stamp_image",
+            label="STAMP_IMAGE_TOKEN",
+            canonical="графический блок печати ST-LK-02",
+            variants=(EntityVariant("графический блок печати ST-LK-02", "STAMP_IMAGE_TOKEN"),),
+        ),
     ]
-    replacements = build_replacements(spans)
+    plan, _ = build_replacement_plan(text, entities)
+    replacements = plan_items_to_replacements(plan)
     assert [(r.label, r.replacement) for r in replacements] == [
         ("SIGNATURE_IMAGE_TOKEN", "[SIGNATURE_IMAGE_TOKEN_1]"),
         ("STAMP_IMAGE_TOKEN", "[STAMP_IMAGE_TOKEN_2]"),
     ]
+
+
+def test_minimal_post_replace_safety_candidates_cover_expected_classes():
+    text = (
+        "ООО «Ромашка» ИП Иванов Иван Иванович 7812345670 "
+        "77:05:0008123:4512 № ДК-77/1 Морозов Алексей Романович"
+    )
+    labels = {item.label for item in collect_safety_candidates(text)}
+    assert "ORG_OR_BANK_MARKER" in labels
+    assert "INN_OR_OGRN" in labels
+    assert "CADASTRAL_NUMBER" in labels
+    assert "CONTRACT_NUMBER_CANDIDATE" in labels
+    assert "CAPITALIZED_RU_SEQUENCE" in labels
+
+
+def test_chunk_text_adds_overlap_for_large_documents():
+    text = ("Абзац один.\n" * 1200).strip()
+    chunks = chunk_text(text, max_chars=1200, overlap=100)
+    assert len(chunks) > 1
+    assert chunks[1][2] < chunks[0][2] + len(chunks[0][1])

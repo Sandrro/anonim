@@ -1,6 +1,12 @@
-# DOCX anonymizer: LLM-first + regex audit
+# DOCX anonymizer: LLM-first pipeline
 
-Короткий проект для обезличивания DOCX. Основной extractor/classifier — LLM. Regex используется как audit/fallback для формальных реквизитов и узкого safety-sweep по стабильным сегментам.
+Сервис обезличивает DOCX через пайплайн:
+
+```text
+extract → normalize/expand → replacement plan → replace → audit → second pass replace
+```
+
+LLM извлекает сущности чанками, группирует варианты и алиасы, а код программно заменяет найденные значения в DOCX. LLM не переписывает документ. Regex оставлен только как минимальный post-replacement safety net для аудита остаточных утечек.
 
 ## Установка
 
@@ -17,36 +23,6 @@ cp .env.example .env
 OPENAI_API_KEY=sk-...
 ```
 
-## OpenAI eval
-
-```bash
-python3 -m anonymizer.cli \
-  --env .env \
-  --model gpt-4.1-mini \
-  --llm-mode openai \
-  eval \
-  --input fixtures/synthetic_obezlichivanie_fixture.docx \
-  --ground-truth fixtures/tokenized_obezlichivanie_fixture.docx \
-  --out-dir outputs/openai_eval
-```
-
-Результаты:
-
-- `anonymized.docx` — обезличенный документ;
-- `anonymization_report.json` — найденные сущности и замены;
-- `eval_metrics.json` — `precision/recall/f1`, `residual_leak_count`, `safety_pass`.
-
-## Offline check без API
-
-```bash
-python3 -m anonymizer.cli \
-  --llm-mode fixture \
-  eval \
-  --input fixtures/synthetic_obezlichivanie_fixture.docx \
-  --ground-truth fixtures/tokenized_obezlichivanie_fixture.docx \
-  --out-dir outputs/fixture_eval
-```
-
 ## Обычное обезличивание
 
 ```bash
@@ -59,13 +35,37 @@ python3 -m anonymizer.cli \
   --output outputs/anonymized.docx
 ```
 
-## Логика
+Отчет будет рядом: `outputs/anonymized.report.json`.
 
-1. LLM broad extraction.
-2. LLM adjudication-pass для уточнения типов.
-3. Regex audit/fallback для формальных сущностей.
-4. Узкий safety-sweep для стабильных сегментов: `IP_FULL`, `PROJECT_NAME`, noisy ФИО/алиасы, подписи, печати, графические блоки подписи/печати.
-5. Eval считает F-score и отдельно проверяет `safety_pass`.
+## Eval на синтетике
+
+```bash
+python3 -m anonymizer.cli \
+  --env .env \
+  --model gpt-4.1-mini \
+  --llm-mode openai \
+  eval \
+  --input fixtures/synthetic_obezlichivanie_fixture.docx \
+  --ground-truth fixtures/tokenized_obezlichivanie_fixture.docx \
+  --out-dir outputs/openai_eval
+```
+
+## Offline check без API
+
+```bash
+python3 -m anonymizer.cli \
+  --llm-mode fixture \
+  eval \
+  --input fixtures/synthetic_obezlichivanie_fixture.docx \
+  --ground-truth fixtures/tokenized_obezlichivanie_fixture.docx \
+  --out-dir outputs/fixture_eval
+```
+
+## Метрики
+
+Основной gate: `safety_pass=true` и `residual_leak_count=0`.
+
+Дополнительно считаются `precision`, `recall`, `f1` по уникальным токенам и по occurrences. Для обезличивания приоритет — recall, не precision.
 
 ## Тесты
 

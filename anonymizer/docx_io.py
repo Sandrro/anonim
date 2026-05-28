@@ -85,5 +85,5 @@ def anonymize_docx_by_values(input_path: str | Path, output_path: str | Path, va
     replacements = sorted(value_to_token.items(), key=lambda item: len(item[0]), reverse=True)
     for paragraph in iter_all_paragraphs(doc):
         _replace_in_paragraph(paragraph, replacements)
-    doc.core_properties.comments = "Anonymized by regex + LLM pipeline."
+    doc.core_properties.comments = "Anonymized by LLM-first extract-normalize-replace-audit pipeline."
     doc.save(str(output_path))
