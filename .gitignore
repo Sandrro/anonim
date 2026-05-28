@@ -27,3 +27,5 @@ outputs/*
 .DS_Store
 .idea/
 .vscode/
+
+documents
