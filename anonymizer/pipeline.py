@@ -12,7 +12,7 @@ from .llm_detector import DisabledLLMDetector, FixtureLLMDetector, OpenAILLMDete
 from .regex_detectors import detect_regex_entities
 from .types import EntitySpan, Replacement
 
-SOURCE_PRIORITY = {"fixture": 4, "regex": 3, "llm": 2}
+SOURCE_PRIORITY = {"fixture": 4, "llm": 3, "regex": 2}
 
 
 def merge_spans(spans: Iterable[EntitySpan]) -> list[EntitySpan]:
@@ -66,11 +66,16 @@ def build_replacements(spans: list[EntitySpan]) -> list[Replacement]:
     for span in spans:
         token = policy.token_for(span.label, span.value)
         replacements.append(Replacement(span.label, span.value, token, span.source, span.confidence))
-    # Для одинакового value regex должен победить LLM/fixture.
+    # Для одинакового value побеждает LLM/fixture; regex остается fallback-аудитом.
     best: dict[str, Replacement] = {}
     for repl in replacements:
         current = best.get(repl.value)
-        if current is None or SOURCE_PRIORITY.get(repl.source, 0) > SOURCE_PRIORITY.get(current.source, 0):
+        if current is None:
+            best[repl.value] = repl
+            continue
+        repl_rank = (SOURCE_PRIORITY.get(repl.source, 0), repl.confidence)
+        current_rank = (SOURCE_PRIORITY.get(current.source, 0), current.confidence)
+        if repl_rank > current_rank:
             best[repl.value] = repl
     return sorted(best.values(), key=lambda r: len(r.value), reverse=True)
 
@@ -87,11 +92,35 @@ def make_detector(mode: str, model: str, env_path: str | None, fixture_mapping: 
     raise ValueError(f"Unknown llm mode: {mode}")
 
 
+def _span_context(text: str, span: EntitySpan, window: int = 90) -> str:
+    start = max(0, span.start - window)
+    end = min(len(text), span.end + window)
+    return text[start:end].replace("\n", " ")
+
+
+def _regex_audit_candidates(text: str, regex_spans: list[EntitySpan]) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[tuple[str, str, int, int]] = set()
+    for span in sorted(regex_spans, key=lambda s: (s.start, s.end, s.label)):
+        key = (span.label, span.value, span.start, span.end)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "label": span.label,
+            "value": span.value,
+            "start": span.start,
+            "end": span.end,
+            "context": _span_context(text, span),
+        })
+    return candidates
+
+
 def anonymize_text(text: str, llm_mode: str = "openai", model: str = "gpt-4.1-mini", env_path: str | None = None, fixture_mapping: str | None = None) -> tuple[str, list[Replacement], list[EntitySpan]]:
     regex_spans = detect_regex_entities(text)
-    regex_values = [s.value for s in regex_spans]
+    regex_candidates = _regex_audit_candidates(text, regex_spans)
     detector = make_detector(llm_mode, model, env_path, fixture_mapping)
-    llm_spans = detector.detect(text, regex_values=regex_values)
+    llm_spans = detector.detect(text, regex_values=regex_candidates)
     spans = merge_spans([*regex_spans, *llm_spans])
     replacements = build_replacements(spans)
 
